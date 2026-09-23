@@ -12,60 +12,51 @@ import {
   type ConsumeOptions,
   type KafkaServiceOptions,
 } from "./types.js";
-import { getTopicConfig } from "./utils.js";
+import { getTopicConfig, DEFAULT_TOPIC_PARTITIONS, DEFAULT_TOPIC_REPLICATION_FACTOR } from "./utils.js";
 
-/**
- * Unified, high-level Kafka facade managing connection pooling, idempotent publishing,
- * reliable consumption with Dead Letter Queue routing, and topic provisioning.
- *
- * @example
- * ```typescript
- * import { KafkaService } from "kafkakit";
- *
- * const kafka = new KafkaService({ clientId: "order-service" });
- *
- * // Publish
- * await kafka.publish({
- *   topic: "orders.created",
- *   messages: [{ key: "order-1", value: { id: "order-1", total: 42 } }],
- * });
- *
- * // Consume with automatic DLQ isolation
- * await kafka.consume({
- *   groupId: "order-workers",
- *   topic: "orders.created",
- *   dlqTopic: "orders.dlq",
- *   handler: async (order) => {
- *     console.log("Processing order:", order);
- *   },
- * });
- * ```
- */
+const DEFAULT_HEALTH_CHECK_TTL_MS = 10_000;
+
+/** Unified, pooled Kafka client: one producer/admin connection shared across publish/consume/ensureTopics. */
 export class KafkaService {
   private readonly kafka: Kafka;
   private readonly producer: Producer;
   private readonly admin: KafkaJSAdmin;
   private readonly consumers: Consumer[] = [];
   private readonly logger: Logger;
+  private readonly allowAutoTopicCreation: boolean;
+  private readonly healthCheckTtlMs: number;
   private adminConnectPromise: Promise<void> | null = null;
+  private healthCache: { result: { isHealthy: boolean; brokers: number }; expiresAt: number } | null = null;
 
   /**
-   * Initializes the unified KafkaService facade with a single connection pool.
-   *
-   * @param options Configuration options including required non-empty `clientId`.
-   * @throws {TypeError} If `clientId` is missing or empty.
+   * @param options.clientId - Required, non-empty kafkajs client id.
+   * @param options.brokers - See {@link getBrokerList}.
+   * @param options.logger - Custom structured logger; defaults to JSON-on-stdout.
+   * @param options.allowAutoTopicCreation - See {@link KafkaServiceOptions.allowAutoTopicCreation}.
+   * @param options.kafka - Bring your own kafkajs client instead of building one.
+   * @param options.healthCheckTtlMs - See {@link KafkaServiceOptions.healthCheckTtlMs}.
+   * @param options.defaultCompression - See {@link ProducerOptions.defaultCompression}.
+   * @throws {Error} If `clientId` is empty or whitespace-only.
    */
   constructor(options: KafkaServiceOptions) {
     if (!options?.clientId || !options.clientId.trim()) {
-      throw new TypeError("KafkaService requires a non-empty 'clientId'");
+      throw new Error("KafkaService requires a non-empty 'clientId'");
     }
 
     this.logger = options.logger ?? createLogger("kafka-kit");
-    this.kafka = createKafkaClient(options.clientId, {
-      brokers: options.brokers,
+    this.allowAutoTopicCreation = options.allowAutoTopicCreation ?? false;
+    this.healthCheckTtlMs = options.healthCheckTtlMs ?? DEFAULT_HEALTH_CHECK_TTL_MS;
+    this.kafka =
+      options.kafka ??
+      createKafkaClient(options.clientId, {
+        brokers: options.brokers,
+        logger: this.logger,
+      });
+    this.producer = new Producer(this.kafka, {
       logger: this.logger,
+      allowAutoTopicCreation: this.allowAutoTopicCreation,
+      defaultCompression: options.defaultCompression,
     });
-    this.producer = new Producer(this.kafka, this.logger);
     this.admin = this.kafka.admin();
   }
 
@@ -79,40 +70,53 @@ export class KafkaService {
     return this.adminConnectPromise;
   }
 
-  /**
-   * Publishes a batch of messages to a Kafka topic.
-   * Automatically serializes JSON and compresses wire payloads using GZIP.
-   *
-   * @param options Publishing options including `topic` and `messages`.
-   */
+  /** See {@link Producer.publish}. */
   async publish(options: PublishOptions): Promise<void> {
     return this.producer.publish(options);
   }
 
   /**
-   * Starts a resilient consumer for the specified topic and group.
+   * Start a new {@link Consumer} and register it for {@link disconnect}.
+   * The consumer is only registered once `start()` succeeds; a failed start
+   * is logged and rethrown without leaving an orphaned consumer behind.
    *
-   * @template T The expected parsed JSON payload type.
-   * @param options Consumer options including `groupId`, `topic`, optional `dlqTopic`, and `handler`.
-   * @returns The active Consumer instance.
+   * @throws Rethrows any error from {@link Consumer.start}.
    */
   async consume<T>(options: ConsumeOptions<T>): Promise<Consumer> {
-    const consumer = new Consumer(this.kafka, options, this.producer, this.logger);
+    const consumer = new Consumer(
+      this.kafka,
+      options,
+      this.producer,
+      this.logger,
+      this.allowAutoTopicCreation
+    );
+
+    try {
+      await consumer.start(options.handler);
+    } catch (err) {
+      this.logger.error("Failed to start Kafka consumer", {
+        topic: options.topic,
+        groupId: options.groupId,
+        error: String(err),
+      });
+      throw err;
+    }
+
     this.consumers.push(consumer);
-    await consumer.start(options.handler);
     return consumer;
   }
 
   /**
-   * Idempotently ensures that the specified topics exist in the Kafka cluster.
-   * If a topic does not exist, it is created with the requested or default partition count.
+   * Create any topics in `topics` that don't already exist, with partition
+   * counts resolved via {@link getTopicConfig}. Tolerates a concurrent
+   * caller winning the create race (TOPIC_ALREADY_EXISTS).
    *
-   * @param topics Array of topic names (string) or detailed TopicConfig objects.
-   * @throws {TypeError} If topics is not an array.
+   * @param topics - Topic names, or {@link TopicConfig} objects for per-topic partition/RF overrides.
+   * @throws {Error} If `topics` is not an array, or on any topic-creation failure other than TOPIC_ALREADY_EXISTS.
    */
   async ensureTopics(topics: (string | TopicConfig)[]): Promise<void> {
     if (!Array.isArray(topics)) {
-      throw new TypeError("ensureTopics requires an array of topic names or TopicConfig objects");
+      throw new Error("ensureTopics() requires an array of topic names or TopicConfig objects");
     }
 
     await this.ensureAdminConnected();
@@ -126,58 +130,127 @@ export class KafkaService {
 
     const topicsToCreate = targetTopics
       .filter((t) => !existingTopics.includes(t.topic))
+      // t.partitions/replicationFactor are always set here (getTopicConfig
+      // already resolved them above); these fallbacks just satisfy
+      // TopicConfig's optional typing, not a live default path.
       .map((t) => ({
         topic: t.topic,
-        numPartitions: t.partitions ?? 16,
-        replicationFactor: t.replicationFactor ?? 1,
+        numPartitions: t.partitions ?? DEFAULT_TOPIC_PARTITIONS,
+        replicationFactor: t.replicationFactor ?? DEFAULT_TOPIC_REPLICATION_FACTOR,
       }));
 
     if (topicsToCreate.length > 0) {
       this.logger.info("Creating Kafka topics", {
         topics: topicsToCreate.map((t) => `${t.topic} (${t.numPartitions}p)`),
       });
-      await this.admin.createTopics({
-        topics: topicsToCreate,
-        waitForLeaders: true,
-      });
+
+      const rf1Topics = topicsToCreate.filter((t) => t.replicationFactor === 1);
+      if (rf1Topics.length > 0) {
+        this.logger.warn(
+          "ensureTopics: creating topic(s) with replicationFactor 1 — no fault tolerance; fine for local dev, risky on a real cluster",
+          { topics: rf1Topics.map((t) => t.topic) }
+        );
+      }
+
+      try {
+        await this.admin.createTopics({
+          topics: topicsToCreate,
+          waitForLeaders: true,
+        });
+      } catch (err) {
+        // Concurrent replicas can race here; the loser gets
+        // TOPIC_ALREADY_EXISTS, which isn't a real failure.
+        if (isTopicAlreadyExistsError(err)) {
+          this.logger.warn("ensureTopics: topic already created by a concurrent caller", {
+            topics: topicsToCreate.map((t) => t.topic),
+          });
+        } else {
+          throw err;
+        }
+      }
     }
   }
 
   /**
-   * Retrieves broker cluster health for Kubernetes liveness/readiness probes.
+   * Check cluster reachability, caching the result for `healthCheckTtlMs`
+   * (default 10s) to avoid flooding the broker with admin RPCs from
+   * frequent liveness/readiness probes. Never throws — any failure
+   * (including a failed admin connect) is logged and reported as unhealthy.
    *
-   * @returns Health status object with `isHealthy: boolean` and active `brokers: number`.
+   * @returns `isHealthy: true` iff the admin connection and `describeCluster()` succeed and report at least one broker.
    */
   async getClusterHealth(): Promise<{ isHealthy: boolean; brokers: number }> {
+    const now = Date.now();
+    if (this.healthCache && this.healthCache.expiresAt > now) {
+      return this.healthCache.result;
+    }
+
     try {
       await this.ensureAdminConnected();
       const cluster = await this.admin.describeCluster();
-      return { isHealthy: cluster.brokers.length > 0, brokers: cluster.brokers.length };
-    } catch {
+      const result = { isHealthy: cluster.brokers.length > 0, brokers: cluster.brokers.length };
+      // Only cache successes: caching a failure would delay detecting
+      // recovery by up to a full TTL on a liveness/readiness probe.
+      this.healthCache = { result, expiresAt: now + this.healthCheckTtlMs };
+      return result;
+    } catch (err) {
+      this.logger.warn("Cluster health check failed", { error: String(err) });
+      this.healthCache = null;
       return { isHealthy: false, brokers: 0 };
     }
   }
 
   /**
-   * Gracefully disconnects all underlying Kafka resources (producers, consumers, and admin).
+   * Disconnect the producer, admin (if connected), and every registered
+   * consumer. Uses allSettled so one resource failing to disconnect doesn't
+   * stop the others from being torn down; failures are logged, not thrown.
    */
   async disconnect(): Promise<void> {
     this.logger.info("Disconnecting KafkaService resources");
-    await Promise.all([
+    const results = await Promise.allSettled([
       this.producer.disconnect(),
       this.adminConnectPromise
-        ? this.adminConnectPromise.then(() => this.admin.disconnect()).catch(() => {})
+        ? this.adminConnectPromise.then(() => this.admin.disconnect())
         : Promise.resolve(),
       ...this.consumers.map((c) => c.stop()),
     ]);
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        this.logger.warn("Error while disconnecting a Kafka resource", {
+          error: String(result.reason),
+        });
+      }
+    }
+
     this.adminConnectPromise = null;
+    this.healthCache = null;
     this.consumers.length = 0;
   }
 }
 
+function isTopicAlreadyExistsError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+
+  if ("type" in err && (err as { type?: unknown }).type === "TOPIC_ALREADY_EXISTS") {
+    return true;
+  }
+
+  // kafkajs surfaces multi-topic failures as an aggregate error with an
+  // `errors` array rather than a top-level `type`.
+  if ("errors" in err && Array.isArray((err as { errors?: unknown[] }).errors)) {
+    const errors = (err as { errors: Array<{ type?: unknown }> }).errors;
+    return errors.length > 0 && errors.every((e) => e?.type === "TOPIC_ALREADY_EXISTS");
+  }
+
+  return false;
+}
+
 export * from "./types.js";
 export * from "./utils.js";
-export * from "./producer.js";
-export * from "./consumer.js";
-export * from "./client.js";
-export * from "./logger.js";
+export { Producer, type ProducerOptions } from "./producer.js";
+export { Consumer } from "./consumer.js";
+export { createKafkaClient, getBrokerList } from "./client.js";
+export { CompressionTypes, registerCompressionCodec } from "./compression.js";
+export type { Logger } from "./logger.js";
+// dlq.js and logger.js's createLogger are internal, not public API.

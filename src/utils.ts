@@ -1,11 +1,15 @@
 import type { TopicConfig } from "./types.js";
 
+export const DEFAULT_TOPIC_PARTITIONS = 16;
+/** RF 1 has zero fault tolerance — fine for local dev, not for a real cluster. ensureTopics() warns when this default is used. */
+export const DEFAULT_TOPIC_REPLICATION_FACTOR = 1;
+
 /**
- * Resolves partition and replication configuration for a given topic with environment fallbacks.
+ * Resolve partition/replication-factor for a topic, in priority order:
+ * explicit `overrides` > `KAFKA_PARTITIONS`/`KAFKA_REPLICATION_FACTOR` env vars > defaults.
  *
- * @param topic The name of the topic.
- * @param overrides Optional per-topic overrides for partitions and replicationFactor.
- * @returns An object containing resolved `partitions` and `replicationFactor`.
+ * @param topic - Topic name (currently unused for resolution, kept for future per-topic policy).
+ * @param overrides - Explicit values that win over everything else.
  */
 export function getTopicConfig(
   topic: string,
@@ -15,26 +19,20 @@ export function getTopicConfig(
   const envReplication = Number(process.env.KAFKA_REPLICATION_FACTOR);
 
   return {
-    partitions: overrides?.partitions ?? (envPartitions || 16),
-    replicationFactor: overrides?.replicationFactor ?? (envReplication || 1),
+    partitions: overrides?.partitions ?? (envPartitions || DEFAULT_TOPIC_PARTITIONS),
+    replicationFactor: overrides?.replicationFactor ?? (envReplication || DEFAULT_TOPIC_REPLICATION_FACTOR),
   };
 }
 
-/**
- * Error indicating that a message cannot be processed successfully under any retry.
- * When thrown inside a consumer handler, the message is classified as a poison pill
- * and forwarded to the configured DLQ immediately without consumer group stalls.
- *
- * @example
- * ```typescript
- * if (!order.userId) {
- *   throw new NonRetryableError("Malformed payload: missing userId");
- * }
- * ```
- */
+/** Thrown by a consumer handler to mark a message as a permanent (non-retryable) failure. */
 export class NonRetryableError extends Error {
   readonly isNonRetryable = true;
 
+  /**
+   * @param message - Human-readable failure reason.
+   * @param code - Optional application-specific error code.
+   * @param details - Optional structured context (e.g. the field that failed validation).
+   */
   constructor(message: string, public readonly code?: string, public readonly details?: unknown) {
     super(message);
     this.name = "NonRetryableError";
@@ -42,11 +40,13 @@ export class NonRetryableError extends Error {
 }
 
 /**
- * Helper to determine whether an error is a permanent, non-retryable poison pill.
- * Identifies SyntaxError (malformed JSON), NonRetryableError, or any error with `{ isNonRetryable: true }`.
+ * Default poison-pill detection: JSON parse failures and NonRetryableError
+ * only. Deliberately narrow — TypeError/RangeError can be transient (e.g. a
+ * flaky DB client), so treating them as permanent by default would misroute
+ * retryable errors to the DLQ. Override via ConsumerOptions.isPoisonPill.
  *
- * @param error The thrown error or rejection reason.
- * @returns `true` if the error should be diverted to DLQ, `false` if it is a transient error.
+ * @param error - The error thrown by JSON.parse or the consumer handler.
+ * @returns true if the message should be routed to the DLQ instead of retried.
  */
 export function isPoisonPill(error: unknown): boolean {
   if (error instanceof SyntaxError) return true;

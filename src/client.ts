@@ -3,6 +3,12 @@ import { createLogger, type Logger } from "./logger.js";
 
 const defaultLogger = createLogger("kafka-kit-client");
 
+/**
+ * Resolve the broker list to connect to.
+ *
+ * @param configuredBrokers - Explicit broker list, if the caller has one.
+ * @returns `configuredBrokers` if non-empty, else `KAFKA_BROKERS` (comma-separated), else `["localhost:9092"]`.
+ */
 export function getBrokerList(configuredBrokers?: string[]): string[] {
   if (configuredBrokers && configuredBrokers.length > 0) {
     return configuredBrokers;
@@ -14,6 +20,16 @@ export function getBrokerList(configuredBrokers?: string[]): string[] {
   return envBrokers.split(",").map((b) => b.trim());
 }
 
+/**
+ * Build a shared kafkajs `Kafka` client with kafka-kit's default retry
+ * policy and a logger bridge (kafkajs WARN/ERROR routed through `Logger`).
+ *
+ * @param clientId - Required, non-empty kafkajs client id.
+ * @param options.brokers - See {@link getBrokerList}.
+ * @param options.logger - Receives kafkajs's own WARN/ERROR log lines.
+ * @param options.config - Raw kafkajs `KafkaConfig` overrides, merged last.
+ * @throws {Error} If `clientId` is empty or whitespace-only.
+ */
 export function createKafkaClient(
   clientId: string,
   options?: { brokers?: string[]; logger?: Logger; config?: Partial<KafkaConfig> }

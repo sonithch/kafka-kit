@@ -23,9 +23,11 @@ Using raw Kafka drivers like `kafkajs` in production often leads to:
 ## Features
 
 * **Single Connection Pool:** Reuses a single Kafka client instance across producer, consumer, and admin operations.
-* **Poison-Pill DLQ Isolation:** Automatically distinguishes permanent syntax/schema failures from transient network blips. Corrupted messages route to your DLQ; transient errors retry.
+* **Poison-Pill DLQ Isolation:** Unparseable JSON (`SyntaxError`) and messages your handler explicitly marks with `NonRetryableError` are routed to your DLQ with the original payload/headers intact, instead of retrying forever. Everything else retries — kafka-kit deliberately does *not* guess at "schema failures," since a generic error can just as easily be a transient downstream issue; opt specific errors in via `NonRetryableError` or a custom `isPoisonPill`. If the DLQ itself is unreachable, kafka-kit retries with backoff and then refuses to drop the message rather than silently losing it.
+* **Tombstone-Safe:** A Kafka tombstone (`value: null`) round-trips correctly — published as a true `null` (so log-compacted topics actually delete the key, not the string `"null"`), and delivered to your handler as `null`, not an empty object.
 * **Idempotent Producer:** `idempotent: true` enabled by default to prevent duplicate writes during network blips.
-* **GZIP Compression:** Automatic wire payload compression.
+* **Snappy Compression by Default:** Lower CPU than GZIP with no size-inflation penalty on small payloads. Override per-call, per-client, or register your own codec (e.g. LZ4).
+* **Slow-Handler Safe:** Handlers get a `heartbeat()`/`pause()` context so long-running work doesn't trigger a consumer-group rebalance; `sessionTimeout` is configurable per consumer.
 * **Zero Magic:** No heavy framework dependencies (no NestJS). Works with Fastify, Express, Hono, Next.js, or standalone background workers.
 * **Dual ESM & CommonJS:** Native support for both `import` and `require()`.
 * **Pluggable Logging:** Out-of-the-box structured JSON logging with support for Pino, Winston, or custom loggers.
@@ -84,7 +86,7 @@ await kafka.publish({
 
 ### 3. Reliable Consumption with DLQ Poison-Pill Routing
 
-If an unparseable payload or non-retryable error occurs, `kafka-kit` logs a warning, forwards the failed payload and stack trace to `dlqTopic`, and commits the offset so the consumer group never stalls:
+If a message fails JSON parsing, or your handler throws `NonRetryableError`, kafka-kit forwards the original payload/headers (plus origin metadata) to `dlqTopic` and commits the offset so the consumer group doesn't stall. Anything else is treated as transient and retried by kafkajs as usual. Handlers get a third `context` argument for `heartbeat()`/`pause()` on slow work:
 
 ```typescript
 import { KafkaService, NonRetryableError } from "kafka-kit";
@@ -92,14 +94,14 @@ import { KafkaService, NonRetryableError } from "kafka-kit";
 const consumer = await kafka.consume({
   groupId: "order-processing-group",
   topic: "orders.created",
-  dlqTopic: "orders.dlq", // 👈 Automatically captures poison pills
-  handler: async (order, rawMessage) => {
+  dlqTopic: "orders.dlq", // 👈 Poison pills route here instead of retrying forever
+  handler: async (order, rawMessage, { heartbeat }) => {
     if (!order.orderId) {
       // Mark as permanent failure -> routes to DLQ
       throw new NonRetryableError("Missing orderId in payload");
     }
 
-    await processOrder(order);
+    await processOrder(order); // call heartbeat() here if this can run long
   },
 });
 
@@ -112,13 +114,19 @@ await kafka.disconnect();
 ### 4. Topic Management & Health Checks
 
 ```typescript
-// Idempotently ensure topics exist before starting workers
+// Idempotently ensure topics exist before starting workers.
+// Warns if it has to fall back to replicationFactor: 1 (fine for local dev,
+// not for a real cluster), and tolerates a concurrent replica winning the
+// create race.
 await kafka.ensureTopics([
   { topic: "orders.created", partitions: 32 },
   { topic: "orders.dlq", partitions: 4 },
 ]);
 
-// Kubernetes Readiness / Liveness Probe
+// Kubernetes Readiness / Liveness Probe. Result is cached for
+// healthCheckTtlMs (default 10s) so frequent probes don't flood the
+// broker; a failed check is never cached, so recovery is picked up on
+// the next call.
 const health = await kafka.getClusterHealth();
 console.log(health); // { isHealthy: true, brokers: 3 }
 ```
@@ -138,6 +146,33 @@ const kafka = new KafkaService({
     warn: (msg, ctx) => pinoLogger.warn(ctx, msg),
     error: (msg, ctx) => pinoLogger.error(ctx, msg),
   },
+});
+```
+
+---
+
+### 6. Advanced Options
+
+```typescript
+import { KafkaService, CompressionTypes, registerCompressionCodec } from "kafka-kit";
+
+const kafka = new KafkaService({
+  clientId: "order-service",
+  defaultCompression: CompressionTypes.GZIP, // override the Snappy default
+  healthCheckTtlMs: 15_000,
+  allowAutoTopicCreation: false, // default; set true to let the broker auto-create topics
+});
+
+// Plug in another codec (e.g. LZ4 via the `kafkajs-lz4` package) globally:
+// registerCompressionCodec(CompressionTypes.LZ4, new LZ4Codec().codec);
+
+const consumer = await kafka.consume({
+  groupId: "order-processing-group",
+  topic: "orders.created",
+  dlqTopic: "orders.dlq",
+  sessionTimeout: 45_000, // raise if handlers can run long without calling heartbeat()
+  dlqRetry: { maxAttempts: 5, baseDelayMs: 300 }, // DLQ publish retry policy
+  handler: async (order) => { /* ... */ },
 });
 ```
 

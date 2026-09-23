@@ -1,61 +1,70 @@
 import {
   type Kafka,
   type Consumer as KafkaJSConsumer,
-  type KafkaMessage,
 } from "kafkajs";
 import { type ConsumerOptions, type ConsumerHandler } from "./types.js";
-import { isPoisonPill } from "./utils.js";
+import { isPoisonPill as defaultIsPoisonPill } from "./utils.js";
+import { forwardToDlq } from "./dlq.js";
 import { type Producer } from "./producer.js";
 import { createLogger, type Logger } from "./logger.js";
 
 const defaultLogger = createLogger("kafka-kit-consumer");
 
-/**
- * High-level message consumer with automatic offset management, heartbeating, and Dead Letter Queue routing.
- */
+/** JSON-message consumer with automatic DLQ routing for poison pills. */
 export class Consumer {
   private rawConsumer: KafkaJSConsumer;
   private readonly logger: Logger;
+  private readonly isPoisonPill: (error: unknown) => boolean;
 
   /**
-   * Creates a new Consumer instance.
-   *
-   * @param kafka The shared KafkaJS client instance.
-   * @param options Consumer configuration options (groupId, topic, dlqTopic, etc.).
-   * @param producer Optional Producer instance used to forward poison pills to the DLQ.
-   * @param logger Optional custom logger.
+   * @param kafka - Shared kafkajs client.
+   * @param options.groupId - Required, non-empty consumer group id.
+   * @param options.topic - Required, non-empty topic to subscribe to.
+   * @param options.dlqTopic - If set (with a producer), poison pills are forwarded here instead of retried.
+   * @param options.isPoisonPill - Overrides the default poison-pill classification.
+   * @param options.sessionTimeout - kafkajs session timeout in ms; defaults to 30000.
+   * @param options.dlqRetry - Retry policy for DLQ forwarding; see {@link DlqRetryPolicy}.
+   * @param producer - Used to publish to `dlqTopic`; required for DLQ routing.
+   * @param allowAutoTopicCreation - Passed through to the underlying kafkajs consumer.
+   * @throws {Error} If `groupId` or `topic` is empty.
    */
   constructor(
     kafka: Kafka,
     private readonly options: ConsumerOptions,
     private readonly producer?: Producer,
-    logger?: Logger
+    logger?: Logger,
+    allowAutoTopicCreation = false
   ) {
     if (!options?.groupId || !options.groupId.trim()) {
-      throw new TypeError("Consumer requires a non-empty 'groupId'");
+      throw new Error("Consumer requires a non-empty 'groupId'");
     }
     if (!options?.topic || !options.topic.trim()) {
-      throw new TypeError("Consumer requires a non-empty 'topic'");
+      throw new Error("Consumer requires a non-empty 'topic'");
     }
 
     this.logger = logger ?? defaultLogger;
+    this.isPoisonPill = options.isPoisonPill ?? defaultIsPoisonPill;
     this.rawConsumer = kafka.consumer({
-      groupId: options.groupId.trim(),
-      allowAutoTopicCreation: true,
-      sessionTimeout: 30000,
+      groupId: options.groupId,
+      allowAutoTopicCreation,
+      sessionTimeout: options.sessionTimeout ?? 30000,
     });
   }
 
   /**
-   * Connects the consumer, subscribes to the topic, and begins processing incoming messages.
+   * Connect, subscribe, and start consuming. Each message is JSON-parsed and
+   * passed to `handler` along with a {@link ConsumerContext} (heartbeat/pause
+   * for slow handlers); a poison pill (see {@link defaultIsPoisonPill}) is
+   * forwarded to the DLQ instead of retried, everything else is rethrown so
+   * kafkajs retries it. A Kafka tombstone (value: null) is passed through as
+   * `null`, not JSON-parsed.
    *
-   * @template T Expected parsed JSON payload type.
-   * @param handler Async function invoked for each message.
-   * @throws {TypeError} If handler is not a function.
+   * @param handler - Invoked with the parsed payload, the raw kafkajs message, and the consumer context.
+   * @throws {Error} If `handler` is not a function.
    */
   async start<T>(handler: ConsumerHandler<T>): Promise<void> {
     if (typeof handler !== "function") {
-      throw new TypeError("Consumer.start requires a valid handler function");
+      throw new Error("Consumer.start() requires a valid handler function");
     }
 
     await this.rawConsumer.connect();
@@ -70,41 +79,34 @@ export class Consumer {
     });
 
     await this.rawConsumer.run({
-      eachMessage: async ({ message }) => {
-        const rawValue = message.value?.toString() ?? "{}";
+      eachMessage: async ({ message, partition, heartbeat, pause }) => {
+        const rawValue = message.value === null || message.value === undefined ? null : message.value.toString();
+        const isTombstone = rawValue === null;
 
         try {
-          const parsed = JSON.parse(rawValue) as T;
-          await handler(parsed, message);
+          const parsed = (isTombstone ? null : JSON.parse(rawValue as string)) as T;
+          await handler(parsed, message, {
+            topic: this.options.topic,
+            partition,
+            heartbeat,
+            pause,
+          });
         } catch (err) {
-          // If a DLQ is configured and the error is a permanent poison pill, divert to DLQ
-          if (this.options.dlqTopic && this.producer && isPoisonPill(err)) {
-            this.logger.warn("Poison pill detected, forwarding to DLQ", {
-              topic: this.options.topic,
-              offset: message.offset,
+          if (this.options.dlqTopic && this.producer && this.isPoisonPill(err)) {
+            await forwardToDlq({
+              producer: this.producer,
               dlqTopic: this.options.dlqTopic,
-              error: String(err),
+              sourceTopic: this.options.topic,
+              partition,
+              message,
+              rawValue: rawValue ?? "null",
+              error: err,
+              logger: this.logger,
+              retry: this.options.dlqRetry,
             });
-
-            await this.producer.publish({
-              topic: this.options.dlqTopic,
-              messages: [
-                {
-                  key: message.key?.toString(),
-                  value: {
-                    sourceTopic: this.options.topic,
-                    offset: message.offset,
-                    payload: rawValue,
-                    error: String(err),
-                    failedAt: Date.now(),
-                  },
-                },
-              ],
-            });
-            return; // Resolves offset automatically so the consumer group does not block
+            return;
           }
 
-          // Transient errors are rethrown to let Kafka retry with backoff
           this.logger.error("Transient error during message processing, triggering retry", {
             topic: this.options.topic,
             offset: message.offset,
@@ -116,9 +118,7 @@ export class Consumer {
     });
   }
 
-  /**
-   * Gracefully stops the consumer and disconnects from the Kafka group.
-   */
+  /** Disconnect the underlying kafkajs consumer. */
   async stop(): Promise<void> {
     await this.rawConsumer.disconnect();
     this.logger.info("Kafka Consumer stopped", { groupId: this.options.groupId });

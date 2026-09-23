@@ -1,0 +1,60 @@
+{
+  "name": "kafka-kit",
+  "version": "0.1.0",
+  "description": "High-level, resilient Kafka client for Node.js with connection pooling, idempotent publishing, and poison-pill DLQ isolation.",
+  "keywords": [
+    "kafka",
+    "kafkajs",
+    "dead-letter-queue",
+    "dlq",
+    "idempotent",
+    "microservices",
+    "typescript",
+    "resilience"
+  ],
+  "author": "Sonith",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.7.1",
+    "typescript": "^5.4.5"
+  }
+}

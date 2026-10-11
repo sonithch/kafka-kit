@@ -159,8 +159,9 @@ export class Consumer {
       error: String(error),
     });
 
-    clearTimeout(s.restartTimer);
+    if (s.restartTimer) clearTimeout(s.restartTimer);
     s.restartTimer = setTimeout(() => {
+      s.restartTimer = undefined;
       if (this.stopped) return;
       // A crash after run() emits CRASH again; a failure inside it lands here.
       this.run(s, handler).catch((err) => this.scheduleRestart(s, handler, err));
@@ -264,7 +265,7 @@ export class Consumer {
   /** Disconnect the underlying kafkajs consumers. Throws the first failure after trying them all. */
   async stop(): Promise<void> {
     this.stopped = true;
-    for (const s of this.stages) clearTimeout(s.restartTimer);
+    for (const s of this.stages) if (s.restartTimer) clearTimeout(s.restartTimer);
     const results = await Promise.allSettled(this.stages.map((s) => s.raw.disconnect()));
     const failed = results.find((r) => r.status === "rejected");
     if (failed) throw failed.reason;

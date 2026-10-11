@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import type { KafkaMessage } from "kafkajs";
 import { KafkaService, NonRetryableError, retryTopicName } from "../src/index.js";
@@ -258,6 +258,15 @@ describe("Consumer crash recovery", () => {
   // setTimeout is mocked in these tests; flush pending promises another way.
   const flush = () => new Promise((r) => setImmediate(r));
 
+  // Node 20+ takes { apis }, Node 18 takes an array.
+  function mockTimeouts(t: TestContext) {
+    try {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+    } catch {
+      (t.mock.timers.enable as unknown as (apis: string[]) => void)(["setTimeout"]);
+    }
+  }
+
   async function started() {
     const fake = makeFakeKafka();
     const consumer = new Consumer(fake.kafka, { groupId: "g", topic: "orders" }, undefined, {
@@ -270,7 +279,7 @@ describe("Consumer crash recovery", () => {
   }
 
   it("restarts a consumer that kafkajs won't restart", async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
+    mockTimeouts(t);
     const { raw, consumer } = await started();
 
     raw.emit(raw.events.CRASH, { restart: false, error: new Error("coordinator not found") });
@@ -283,7 +292,7 @@ describe("Consumer crash recovery", () => {
   });
 
   it("leaves restarts to kafkajs when it will restart itself", async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
+    mockTimeouts(t);
     const { raw, consumer } = await started();
 
     raw.emit(raw.events.CRASH, { restart: true, error: new Error("retriable") });
@@ -295,7 +304,7 @@ describe("Consumer crash recovery", () => {
   });
 
   it("keeps retrying when the restart itself fails, and stops after stop()", async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
+    mockTimeouts(t);
     const { raw, consumer } = await started();
     raw.failConnect = true;
 

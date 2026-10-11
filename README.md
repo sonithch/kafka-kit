@@ -247,6 +247,20 @@ const consumer = await kafka.consume({
 
 ---
 
+## Development
+
+```bash
+npm test                     # unit tests (no broker needed)
+
+docker compose up -d --wait  # single-node KRaft broker on localhost:9092
+npm run test:integration     # end-to-end workflows against it
+docker compose down -v
+```
+
+Use `KAFKA_PORT=19092 docker compose up -d --wait` with `KAFKA_BROKERS=localhost:19092` if 9092 is taken, and `IT_VERBOSE=1` to see kafka-kit and kafkajs logs.
+
+---
+
 ## License
 
 MIT © [Sonith](https://github.com/sonithch)

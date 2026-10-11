@@ -20,6 +20,8 @@ function makeFakeKafka() {
 
   const rawConsumer = {
     connect: async () => {},
+    events: {},
+    on: () => {},
     subscribe: async () => {},
     run: async (opts: { eachMessage: EachMessageFn }) => {
       eachMessage = opts.eachMessage;

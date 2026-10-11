@@ -45,7 +45,8 @@
     "build": "tsup src/index.ts --format cjs,esm --dts --clean --minify --treeshake",
     "test": "tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test:integration": "tsx --test test/integration/*.test.ts"
   },
   "dependencies": {
     "kafkajs": "^2.2.4",
@@ -56,5 +57,10 @@
     "tsup": "^8.5.1",
     "tsx": "^4.7.1",
     "typescript": "^5.4.5"
+  },
+  "overrides": {
+    "tsup": {
+      "esbuild": "^0.28.2"
+    }
   }
 }

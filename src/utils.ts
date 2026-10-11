@@ -54,3 +54,8 @@ export function isPoisonPill(error: unknown): boolean {
   if (typeof error === "object" && error !== null && "isNonRetryable" in error) return true;
   return false;
 }
+
+/** Name of retry stage `stage` (1-based) for `topic`, e.g. `orders.created.retry.1`. */
+export function retryTopicName(topic: string, stage: number): string {
+  return `${topic}.retry.${stage}`;
+}

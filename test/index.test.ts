@@ -51,6 +51,8 @@ describe("KafkaService", () => {
       }),
       consumer: () => ({
         connect: async () => {},
+        events: {},
+        on: () => {},
         subscribe: async () => {
           throw new Error("subscribe failed");
         },

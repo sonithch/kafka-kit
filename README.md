@@ -27,6 +27,11 @@ Using raw Kafka drivers like `kafkajs` in production often leads to:
 * **Tombstone-Safe:** A Kafka tombstone (`value: null`) round-trips correctly — published as a true `null` (so log-compacted topics actually delete the key, not the string `"null"`), and delivered to your handler as `null`, not an empty object.
 * **Idempotent Producer:** `idempotent: true` enabled by default to prevent duplicate writes during network blips.
 * **Snappy Compression by Default:** Lower CPU than GZIP with no size-inflation penalty on small payloads. Override per-call, per-client, or register your own codec (e.g. LZ4).
+* **Bounded Retries:** Opt-in in-place retries with backoff, then delayed retry topics (`orders.retry.1`, `orders.retry.2`, …), then the DLQ — a flaky dependency can't block a partition forever.
+* **Self-Healing Consumers:** kafkajs leaves a consumer dead after a non-retriable crash (e.g. "group coordinator not found" while a broker restarts); kafka-kit restarts it with capped, jittered backoff.
+* **KRaft-Ready Topic Creation:** `ensureTopics()` waits until new partitions actually have a serving leader, avoiding the not-leader errors that hit the first publish on Kafka 3.3+/4.x.
+* **Graceful Shutdown:** `shutdownOnSignals()` stops consumers before the producer on SIGTERM/SIGINT, so in-flight DLQ forwards finish.
+* **Managed-Cluster Ready:** `ssl`/`sasl` options for Confluent Cloud, MSK, Aiven and friends.
 * **Slow-Handler Safe:** Handlers get a `heartbeat()`/`pause()` context so long-running work doesn't trigger a consumer-group rebalance; `sessionTimeout` is configurable per consumer.
 * **Zero Magic:** No heavy framework dependencies (no NestJS). Works with Fastify, Express, Hono, Next.js, or standalone background workers.
 * **Dual ESM & CommonJS:** Native support for both `import` and `require()`.
@@ -111,7 +116,57 @@ await kafka.disconnect();
 
 ---
 
-### 4. Topic Management & Health Checks
+### 4. Bounded Retries & Retry Topics
+
+By default a transient error is rethrown and kafkajs retries it indefinitely. Set `retry` to bound that:
+
+```typescript
+await kafka.consume({
+  groupId: "order-processing-group",
+  topic: "orders.created",
+  dlqTopic: "orders.dlq",
+  retry: {
+    attempts: 3,                    // in-place tries per delivery (default 3)
+    backoffMs: 200,                 // ~200ms, ~400ms, ... between tries (default 200)
+    jitter: true,                   // randomize each wait to 50–100% of it (default true)
+    topicDelaysMs: [5_000, 60_000], // optional: retry topics, then the DLQ
+  },
+  handler: async (order) => { /* ... */ },
+});
+```
+
+Jitter keeps many consumers that failed together from retrying in lockstep against a recovering dependency; DLQ publish retries are jittered the same way (`dlqRetry.jitter`). Retry-topic delays are exact, since each stage relies on messages becoming due in order.
+
+When in-place attempts run out, the message moves to `orders.created.retry.1` and is handled again after 5s, then `orders.created.retry.2` after 60s, then the DLQ. Each hop adds an `x-retry-count` header and keeps the original `x-origin-*` headers. Each stage runs as its own consumer group (`order-processing-group.retry.N`), so waiting on a delayed message never holds up the main topic. Create the retry topics up front:
+
+```typescript
+import { retryTopicName } from "kafka-kit";
+
+await kafka.ensureTopics([
+  "orders.created",
+  retryTopicName("orders.created", 1),
+  retryTopicName("orders.created", 2),
+  "orders.dlq",
+]);
+```
+
+Without `dlqTopic`, exhausted retries are rethrown as before.
+
+---
+
+### 5. Graceful Shutdown
+
+```typescript
+// On SIGTERM/SIGINT: stop consumers, then the producer and admin, then exit.
+// A second signal or the timeout exits immediately.
+kafka.shutdownOnSignals({ timeoutMs: 10_000 });
+```
+
+Pass `exit: false` to disconnect without calling `process.exit()`; the returned function removes the handlers.
+
+---
+
+### 6. Topic Management & Health Checks
 
 ```typescript
 // Idempotently ensure topics exist before starting workers.
@@ -133,7 +188,7 @@ console.log(health); // { isHealthy: true, brokers: 3 }
 
 ---
 
-### 5. Custom Logger (e.g. Pino, Winston)
+### 7. Custom Logger (e.g. Pino, Winston)
 
 ```typescript
 import pino from "pino";
@@ -151,7 +206,21 @@ const kafka = new KafkaService({
 
 ---
 
-### 6. Advanced Options
+### 8. Security (SSL / SASL)
+
+```typescript
+const kafka = new KafkaService({
+  clientId: "order-service",
+  brokers: ["pkc-xxxx.confluent.cloud:9092"],
+  ssl: true,
+  sasl: { mechanism: "plain", username: process.env.KAFKA_KEY!, password: process.env.KAFKA_SECRET! },
+  // config: { connectionTimeout: 5_000 }, // any other kafkajs KafkaConfig overrides
+});
+```
+
+---
+
+### 9. Advanced Options
 
 ```typescript
 import { KafkaService, CompressionTypes, registerCompressionCodec } from "kafka-kit";
@@ -180,4 +249,4 @@ const consumer = await kafka.consume({
 
 ## License
 
-MIT © [Sonith](https://github.com/sonith)
+MIT © [Sonith](https://github.com/sonithch)

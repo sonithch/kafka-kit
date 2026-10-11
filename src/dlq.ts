@@ -2,13 +2,11 @@ import type { KafkaMessage } from "kafkajs";
 import { type Producer } from "./producer.js";
 import { type Logger } from "./logger.js";
 import { type DlqRetryPolicy } from "./types.js";
+import { sleep, withJitter } from "./backoff.js";
 
 const DEFAULT_DLQ_PUBLISH_MAX_ATTEMPTS = 3;
 const DEFAULT_DLQ_PUBLISH_BASE_DELAY_MS = 200;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /** Flatten kafkajs's `Buffer | string | (Buffer|string)[]` header values to plain strings. */
 export function toStringHeaders(headers?: KafkaMessage["headers"]): Record<string, string> | undefined {
@@ -32,6 +30,10 @@ export interface ForwardToDlqParams {
   logger: Logger;
   /** See {@link DlqRetryPolicy}. Defaults to 3 attempts, 200ms base delay. */
   retry?: DlqRetryPolicy;
+  /** Extra headers added after the origin metadata (e.g. x-retry-count). */
+  headers?: Record<string, string>;
+  /** Log line for the forward; defaults to the poison-pill message. */
+  reason?: string;
 }
 
 /**
@@ -53,10 +55,14 @@ export interface ForwardToDlqParams {
  */
 export async function forwardToDlq(params: ForwardToDlqParams): Promise<void> {
   const { producer, dlqTopic, sourceTopic, partition, message, rawValue, error, logger } = params;
+  // Keep the first origin when a message moves through retry topics.
+  const originHeaders = toStringHeaders(message.headers) ?? {};
+  const isFromRetryTopic = originHeaders["x-origin-topic"] !== undefined;
   const maxAttempts = params.retry?.maxAttempts ?? DEFAULT_DLQ_PUBLISH_MAX_ATTEMPTS;
   const baseDelayMs = params.retry?.baseDelayMs ?? DEFAULT_DLQ_PUBLISH_BASE_DELAY_MS;
+  const jitter = params.retry?.jitter ?? true;
 
-  logger.warn("Poison pill detected, forwarding to DLQ", {
+  logger.warn(params.reason ?? "Poison pill detected, forwarding to DLQ", {
     topic: sourceTopic,
     partition,
     offset: message.offset,
@@ -73,12 +79,17 @@ export async function forwardToDlq(params: ForwardToDlqParams): Promise<void> {
             key: message.key?.toString(),
             value: rawValue,
             headers: {
-              ...(toStringHeaders(message.headers) ?? {}),
-              "x-origin-topic": sourceTopic,
-              "x-origin-partition": String(partition),
-              "x-origin-offset": message.offset,
+              ...originHeaders,
+              ...(isFromRetryTopic
+                ? {}
+                : {
+                    "x-origin-topic": sourceTopic,
+                    "x-origin-partition": String(partition),
+                    "x-origin-offset": message.offset,
+                  }),
               "x-exception-message": String(error),
               "x-failed-at": String(Date.now()),
+              ...params.headers,
             },
           },
         ],
@@ -93,7 +104,8 @@ export async function forwardToDlq(params: ForwardToDlqParams): Promise<void> {
         error: String(dlqErr),
       });
       if (attempt < maxAttempts) {
-        await sleep(baseDelayMs * attempt);
+        const delayMs = baseDelayMs * attempt;
+        await sleep(jitter ? withJitter(delayMs) : delayMs);
       }
     }
   }

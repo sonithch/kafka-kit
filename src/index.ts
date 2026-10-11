@@ -4,6 +4,7 @@ import {
 } from "kafkajs";
 import { createLogger, type Logger } from "./logger.js";
 import { createKafkaClient } from "./client.js";
+import { sleep } from "./backoff.js";
 import { Producer } from "./producer.js";
 import { Consumer } from "./consumer.js";
 import {
@@ -11,10 +12,14 @@ import {
   type PublishOptions,
   type ConsumeOptions,
   type KafkaServiceOptions,
+  type ShutdownOptions,
 } from "./types.js";
 import { getTopicConfig, DEFAULT_TOPIC_PARTITIONS, DEFAULT_TOPIC_REPLICATION_FACTOR } from "./utils.js";
 
 const DEFAULT_HEALTH_CHECK_TTL_MS = 10_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+const TOPIC_LEADER_TIMEOUT_MS = 10_000;
+const TOPIC_LEADER_POLL_MS = 100;
 
 /** Unified, pooled Kafka client: one producer/admin connection shared across publish/consume/ensureTopics. */
 export class KafkaService {
@@ -36,6 +41,9 @@ export class KafkaService {
    * @param options.kafka - Bring your own kafkajs client instead of building one.
    * @param options.healthCheckTtlMs - See {@link KafkaServiceOptions.healthCheckTtlMs}.
    * @param options.defaultCompression - See {@link ProducerOptions.defaultCompression}.
+   * @param options.ssl - TLS settings passed to kafkajs.
+   * @param options.sasl - SASL auth passed to kafkajs.
+   * @param options.config - Raw kafkajs config overrides, merged last.
    * @throws {Error} If `clientId` is empty or whitespace-only.
    */
   constructor(options: KafkaServiceOptions) {
@@ -51,6 +59,7 @@ export class KafkaService {
       createKafkaClient(options.clientId, {
         brokers: options.brokers,
         logger: this.logger,
+        config: { ssl: options.ssl, sasl: options.sasl, ...options.config },
       });
     this.producer = new Producer(this.kafka, {
       logger: this.logger,
@@ -153,9 +162,11 @@ export class KafkaService {
       }
 
       try {
+        // kafkajs's waitForLeaders bails on errors KRaft brokers return
+        // briefly after a create; waitForTopicLeaders handles those.
         await this.admin.createTopics({
           topics: topicsToCreate,
-          waitForLeaders: true,
+          waitForLeaders: false,
         });
       } catch (err) {
         // Concurrent replicas can race here; the loser gets
@@ -166,6 +177,33 @@ export class KafkaService {
           });
         } else {
           throw err;
+        }
+      }
+
+      await this.waitForTopicLeaders(topicsToCreate.map((t) => t.topic));
+    }
+  }
+
+  /**
+   * Wait until every partition of `topics` has a leader that serves requests.
+   * Uses ListOffsets rather than metadata: on KRaft, metadata can name a
+   * leader before that broker accepts produce/fetch for the partition.
+   *
+   * @throws {Error} If not ready within `timeoutMs`, or on any non-transient error.
+   */
+  private async waitForTopicLeaders(topics: string[], timeoutMs = TOPIC_LEADER_TIMEOUT_MS): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (const topic of topics) {
+      for (;;) {
+        try {
+          await this.admin.fetchTopicOffsets(topic);
+          break;
+        } catch (err) {
+          if (!isTransientTopicError(err)) throw err;
+          if (Date.now() > deadline) {
+            throw new Error(`kafka-kit: timed out waiting for a leader for topic '${topic}'`, { cause: err });
+          }
+          await sleep(TOPIC_LEADER_POLL_MS);
         }
       }
     }
@@ -201,21 +239,22 @@ export class KafkaService {
   }
 
   /**
-   * Disconnect the producer, admin (if connected), and every registered
-   * consumer. Uses allSettled so one resource failing to disconnect doesn't
-   * stop the others from being torn down; failures are logged, not thrown.
+   * Stop every registered consumer, then disconnect the producer and admin
+   * (if connected). Consumers go first so in-flight DLQ/retry forwards can
+   * still use the producer. Uses allSettled so one failure doesn't stop the
+   * rest from being torn down; failures are logged, not thrown.
    */
   async disconnect(): Promise<void> {
     this.logger.info("Disconnecting KafkaService resources");
+    const consumerResults = await Promise.allSettled(this.consumers.map((c) => c.stop()));
     const results = await Promise.allSettled([
       this.producer.disconnect(),
       this.adminConnectPromise
         ? this.adminConnectPromise.then(() => this.admin.disconnect())
         : Promise.resolve(),
-      ...this.consumers.map((c) => c.stop()),
     ]);
 
-    for (const result of results) {
+    for (const result of [...consumerResults, ...results]) {
       if (result.status === "rejected") {
         this.logger.warn("Error while disconnecting a Kafka resource", {
           error: String(result.reason),
@@ -227,6 +266,58 @@ export class KafkaService {
     this.healthCache = null;
     this.consumers.length = 0;
   }
+
+  /**
+   * Disconnect cleanly on SIGTERM/SIGINT (e.g. a Kubernetes pod stop), then
+   * exit. A second signal, or `timeoutMs` passing, exits immediately.
+   *
+   * @returns A function that removes the signal handlers.
+   */
+  shutdownOnSignals(options: ShutdownOptions = {}): () => void {
+    const signals = options.signals ?? ["SIGTERM", "SIGINT"];
+    const timeoutMs = options.timeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+    const exit = options.exit ?? true;
+    let shuttingDown = false;
+
+    const onSignal = async (signal: NodeJS.Signals) => {
+      if (shuttingDown) {
+        if (exit) process.exit(1);
+        return;
+      }
+      shuttingDown = true;
+      this.logger.info("Shutdown signal received, disconnecting Kafka", { signal });
+
+      let timer: NodeJS.Timeout | undefined;
+      const timedOut = await Promise.race([
+        this.disconnect().then(() => false),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), timeoutMs);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (timedOut) this.logger.warn("Kafka shutdown timed out", { timeoutMs });
+      if (exit) process.exit(timedOut ? 1 : 0);
+    };
+
+    for (const signal of signals) process.on(signal, onSignal);
+    return () => {
+      for (const signal of signals) process.off(signal, onSignal);
+    };
+  }
+}
+
+const TRANSIENT_TOPIC_ERRORS = new Set([
+  "UNKNOWN_TOPIC_OR_PARTITION",
+  "LEADER_NOT_AVAILABLE",
+  "NOT_LEADER_FOR_PARTITION",
+]);
+
+/** True if `err` (or a kafkajs `cause` it wraps) is a "topic not ready yet" error. */
+function isTransientTopicError(err: unknown): boolean {
+  for (let e = err; typeof e === "object" && e !== null; e = (e as { cause?: unknown }).cause) {
+    if (TRANSIENT_TOPIC_ERRORS.has(String((e as { type?: unknown }).type))) return true;
+  }
+  return false;
 }
 
 function isTopicAlreadyExistsError(err: unknown): boolean {

@@ -1,4 +1,4 @@
-import type { CompressionTypes, Kafka, KafkaMessage } from "kafkajs";
+import type { CompressionTypes, Kafka, KafkaConfig, KafkaMessage } from "kafkajs";
 import type { Logger } from "./logger.js";
 
 export interface TopicConfig {
@@ -39,6 +39,32 @@ export interface DlqRetryPolicy {
   maxAttempts?: number;
   /** Default 200ms; attempt N waits baseDelayMs * N before the next try. */
   baseDelayMs?: number;
+  /** Randomize each wait to between half and all of it. Default true. */
+  jitter?: boolean;
+}
+
+/**
+ * Bounded retry policy for transient (non-poison-pill) handler failures.
+ * Without it, transient errors are rethrown and kafkajs retries them
+ * indefinitely, blocking the partition.
+ */
+export interface ConsumerRetryPolicy {
+  /** In-place handler attempts per delivery, including the first. Default 3. */
+  attempts?: number;
+  /** Delay before in-place attempt N+1 is backoffMs * 2^(N-1). Default 200ms. */
+  backoffMs?: number;
+  /**
+   * Randomize each in-place wait to between half and all of it, so consumers
+   * that failed together don't retry together. Default true. Retry-topic
+   * delays are never jittered: each stage relies on FIFO due times.
+   */
+  jitter?: boolean;
+  /**
+   * Delays (ms) for retry topics. Stage N republishes to
+   * `${topic}.retry.N` (see retryTopicName) and is redelivered after
+   * delays[N-1]. Create these topics up front, e.g. via ensureTopics().
+   */
+  topicDelaysMs?: number[];
 }
 
 export interface ConsumerOptions {
@@ -56,6 +82,11 @@ export interface ConsumerOptions {
   sessionTimeout?: number;
   /** Retry policy for DLQ forwarding. See {@link DlqRetryPolicy}. */
   dlqRetry?: DlqRetryPolicy;
+  /**
+   * Bounded retries for transient failures. Once exhausted, the message goes
+   * to `dlqTopic` (if set) instead of blocking the partition. See {@link ConsumerRetryPolicy}.
+   */
+  retry?: ConsumerRetryPolicy;
 }
 
 export interface ConsumeOptions<T = unknown> extends ConsumerOptions {
@@ -86,4 +117,19 @@ export interface KafkaServiceOptions {
   healthCheckTtlMs?: number;
   /** Default compression for publish() calls; see ProducerOptions.defaultCompression. */
   defaultCompression?: CompressionTypes;
+  /** TLS settings, e.g. `true` for managed clusters (Confluent Cloud, MSK, Aiven). */
+  ssl?: KafkaConfig["ssl"];
+  /** SASL auth, e.g. `{ mechanism: "plain", username, password }`. */
+  sasl?: KafkaConfig["sasl"];
+  /** Raw kafkajs config overrides, merged last. Ignored when `kafka` is given. */
+  config?: Partial<KafkaConfig>;
+}
+
+export interface ShutdownOptions {
+  /** Default ["SIGTERM", "SIGINT"]. */
+  signals?: NodeJS.Signals[];
+  /** Max time to wait for disconnect() before exiting anyway. Default 10000. */
+  timeoutMs?: number;
+  /** Call process.exit() after shutdown. Default true. */
+  exit?: boolean;
 }
